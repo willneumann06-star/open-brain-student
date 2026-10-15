@@ -137,6 +137,12 @@
     .more:hover:not(:disabled) { background: none; color: #a5b4fc; }
     .thought-time { font-size: 0.72rem; color: #444; margin-top: 8px; }
     .empty { color: #333; font-size: 0.875rem; text-align: center; padding: 40px 0; }
+    details.manual { margin-top: 14px; border-top: 1px solid #1e1e1e; padding-top: 12px; }
+    details.manual summary { cursor: pointer; font-size: 0.8rem; color: #777; list-style: none; }
+    details.manual summary::-webkit-details-marker { display: none; }
+    details.manual summary::before { content: '▸ '; }
+    details.manual[open] summary::before { content: '▾ '; }
+    details.manual[open] summary { margin-bottom: 10px; }
     mark { background: #3730a3; color: #fff; border-radius: 2px; padding: 0 1px; }
   </style>
 </head>
@@ -226,20 +232,27 @@
             <img id="ytThumb" alt="">
             <div class="title" id="ytTitleShow"></div>
           </div>
+          <div class="row" style="margin: 0 0 4px">
+            <button id="ytAutoBtn" onclick="autoYouTube()">⚡ Capture automatically</button>
+            <a class="button" id="ytLink" target="_blank" rel="noopener">▶ Open video</a>
+          </div>
+          <div class="msg" id="ytAutoMsg" style="margin-top:8px"></div>
+          <details class="manual" id="ytManual">
+          <summary>Or paste the transcript yourself</summary>
           <div class="field"><input type="text" id="ytTitle" placeholder="Video title"></div>
-          <p class="help">YouTube doesn't let web pages grab transcripts (you'll automate this in Level 3). For now:</p>
+          <p class="help">Use this if automatic capture can't get the transcript:</p>
           <ol class="help">
-            <li>Click <b>Open video</b> below</li>
+            <li>Click <b>Open video</b> above</li>
             <li>Under the video, click <b>...more</b> in the description, then <b>Show transcript</b></li>
             <li>In the transcript panel, click <b>⋮</b> → <b>Toggle timestamps</b> to hide them</li>
             <li>Select all the transcript text, copy it, and paste it below</li>
           </ol>
-          <div class="row" style="margin: 0 0 12px"><a class="button" id="ytLink" target="_blank" rel="noopener">▶ Open video</a></div>
           <textarea id="ytTranscript" placeholder="Paste the transcript here" rows="6"></textarea>
           <div class="row">
-            <button id="ytBtn" onclick="saveYouTube()">Save to Brain</button>
+            <button id="ytBtn" class="secondary" onclick="saveYouTube()">Save pasted transcript</button>
             <span class="msg" id="ytMsg"></span>
           </div>
+          </details>
         </div>
         <div class="msg" id="ytUrlMsg"></div>
       </div>
@@ -267,13 +280,19 @@
     <section class="panel hidden" id="panel-url">
       <div class="card">
         <div class="field"><input type="url" id="urlInput" placeholder="https://… the article's address" autocomplete="off"></div>
-        <div class="field"><input type="text" id="urlTitle" placeholder="Title (optional)"></div>
-        <p class="help">Browsers block one website from reading another, for good security reasons — so your app can't fetch the article itself yet (Level 3 fixes this). Open the article, select the text, copy it, and paste it below.</p>
-        <textarea id="urlText" placeholder="Paste the article text here" rows="6"></textarea>
-        <div class="row">
-          <button id="urlBtn" onclick="saveUrl()">Save to Brain</button>
-          <span class="msg" id="urlMsg"></span>
+        <div class="row" style="margin-top:0">
+          <button id="urlAutoBtn" onclick="autoUrl()">⚡ Capture automatically</button>
         </div>
+        <div class="msg" id="urlAutoMsg" style="margin-top:8px"></div>
+        <details class="manual" id="urlManual">
+          <summary>Or paste the text yourself (paywalls, logins, pages that won't load)</summary>
+          <div class="field"><input type="text" id="urlTitle" placeholder="Title (optional)"></div>
+          <textarea id="urlText" placeholder="Paste the article text here" rows="6"></textarea>
+          <div class="row">
+            <button id="urlBtn" class="secondary" onclick="saveUrl()">Save pasted text</button>
+            <span class="msg" id="urlMsg"></span>
+          </div>
+        </details>
       </div>
     </section>
 
@@ -546,6 +565,39 @@
   })
   $('ytTitle').addEventListener('input', () => { $('ytTitleShow').textContent = $('ytTitle').value })
 
+  // Calls one of your Edge Functions. supabase-js attaches your login token
+  // automatically, which is how the function knows whose brain to save into.
+  async function callFunction(name, body) {
+    const { data, error } = await db.functions.invoke(name, { body })
+    if (error) {
+      let msg = error.message
+      try { const j = await error.context.json(); if (j && j.error) msg = j.error } catch {}
+      throw new Error(msg)
+    }
+    if (!data || !data.ok) throw new Error((data && data.error) || 'Something went wrong')
+    return data
+  }
+
+  async function autoYouTube() {
+    if (!ytId) return setMsg('ytAutoMsg', 'Paste a YouTube link first.', 'err')
+    const btn = $('ytAutoBtn'); btn.disabled = true; btn.textContent = 'Fetching transcript...'
+    setMsg('ytAutoMsg', 'Your server is fetching the video. This can take up to 30 seconds.', 'info')
+    try {
+      const r = await callFunction('capture-youtube', { url: 'https://www.youtube.com/watch?v=' + ytId })
+      $('ytUrl').value = ''; $('ytDetails').classList.add('hidden'); ytId = null
+      setMsg('ytAutoMsg', '')
+      if (r.has_transcript) {
+        setMsg('ytUrlMsg', `✓ Saved "${r.title}" — ${r.chars.toLocaleString()} characters of transcript (via ${r.fetched_via})`, 'ok')
+      } else {
+        setMsg('ytUrlMsg', `⚠ Saved "${r.title}", but no transcript was available, so only the video DESCRIPTION was saved. If the video has captions, paste the transcript yourself for the real thing.`, 'err')
+      }
+      loadRecent()
+    } catch (e) {
+      setMsg('ytAutoMsg', '✗ ' + e.message + ' — you can paste the transcript yourself below.', 'err')
+      $('ytManual').open = true
+    } finally { btn.disabled = false; btn.textContent = '⚡ Capture automatically' }
+  }
+
   async function saveYouTube() {
     if (!ytId) return setMsg('ytMsg', 'Paste a YouTube link first.', 'err')
     const transcript = decodeEntities($('ytTranscript').value).trim()
@@ -558,6 +610,7 @@
       await insertSource(thoughtId, transcript, 'youtube_transcript')
       $('ytUrl').value = ''; $('ytTranscript').value = ''; $('ytTitle').value = ''
       $('ytDetails').classList.add('hidden'); ytId = null
+      $('ytManual').open = false
       setMsg('ytUrlMsg', '✓ Saved "' + title + '"', 'ok'); loadRecent()
     } catch (e) { setMsg('ytMsg', '✗ ' + e.message, 'err') }
     finally { busy('ytBtn', false) }
@@ -622,6 +675,24 @@
   }
 
   // ─── url ──────────────────────────────────────────────────
+  async function autoUrl() {
+    let url = $('urlInput').value.trim()
+    if (!url) return setMsg('urlAutoMsg', 'Add the article\'s address.', 'err')
+    if (!/^https?:\/\//i.test(url)) url = 'https://' + url
+    try { new URL(url) } catch { return setMsg('urlAutoMsg', 'That address doesn\'t look right.', 'err') }
+    const btn = $('urlAutoBtn'); btn.disabled = true; btn.textContent = 'Fetching page...'
+    setMsg('urlAutoMsg', 'Your server is reading the page...', 'info')
+    try {
+      const r = await callFunction('capture-url', { url })
+      $('urlInput').value = ''
+      setMsg('urlAutoMsg', `✓ Saved "${r.title}" — ${r.chars.toLocaleString()} characters`, 'ok')
+      loadRecent()
+    } catch (e) {
+      setMsg('urlAutoMsg', '✗ ' + e.message, 'err')
+      $('urlManual').open = true
+    } finally { btn.disabled = false; btn.textContent = '⚡ Capture automatically' }
+  }
+
   async function saveUrl() {
     let url = $('urlInput').value.trim()
     const text = decodeEntities($('urlText').value).trim()
