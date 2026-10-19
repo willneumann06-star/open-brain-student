@@ -108,7 +108,7 @@ Deno.serve(async () => {
     // 5. Save it back into the brain
     const fmt = (x: Date) => x.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
     const title = `🗓️ Weekly digest — ${fmt(weekAgo)} to ${fmt(now)}`
-    const { error: insErr } = await db.from('thoughts').insert({
+    const { error: insErr } = await db.from('thoughts').upsert({
       user_id: OWNER_USER_ID,
       content: `${title}\n\n${String(d.text).trim()}`,
       category: 'digest',
@@ -116,7 +116,7 @@ Deno.serve(async () => {
       summary: `Weekly digest of ${rows.length} thoughts, ${fmt(weekAgo)}–${fmt(now)}`,
       enriched_at: now.toISOString(), // tells the enrichment agent to leave it alone
       metadata: { source: 'weekly-digest', thought_count: rows.length },
-    })
+    }, { onConflict: 'dedup_key,user_id', ignoreDuplicates: false }).select('id, created_at').single()
     if (insErr) throw insErr
 
     console.log(`[digest] written from ${rows.length} thoughts`)

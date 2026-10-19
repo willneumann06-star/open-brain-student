@@ -34,7 +34,7 @@ const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
 const MCP_ACCESS_KEY = Deno.env.get('MCP_ACCESS_KEY') ?? ''
 const OWNER_USER_ID = Deno.env.get('OWNER_USER_ID') ?? ''
 
-const SERVER_INFO = { name: 'open-brain', version: '1.0.0' }
+const SERVER_INFO = { name: 'open-brain', version: '1.1.0' }
 const SUPPORTED_PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05']
 
 const corsHeaders = {
@@ -69,14 +69,16 @@ const TOOLS = [
   {
     name: 'search_thoughts',
     description:
-      "Search the user's personal knowledge base (their 'Open Brain') for saved thoughts containing a word or phrase. " +
+      "Search the user's personal knowledge base (their 'Open Brain') by meaning. " +
       'Captures include typed notes, voice notes, Telegram messages, YouTube transcripts, PDFs and web articles. ' +
-      'This is keyword search: try several short keywords or synonyms if the first search finds nothing. ' +
+      'This is semantic search: describe the idea in natural words — it finds related thoughts even when they use ' +
+      'different words. Each result shows a similarity score and the thoughts it is linked to in the user\'s thought graph. ' +
+      'If meaning search is unavailable it falls back to keyword matching. ' +
       'Long results are trimmed — use get_thought with the id to read one in full.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Word or short phrase to look for, e.g. "valuation" or "term sheet"' },
+        query: { type: 'string', description: 'What to look for, in natural words, e.g. "how startups get valued"' },
         limit: { type: 'number', description: 'Max results, 1-25 (default 10)' },
       },
       required: ['query'],
@@ -119,14 +121,89 @@ function clampInt(v: unknown, min: number, max: number, fallback: number): numbe
   return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback
 }
 
-type Row = { id: string; content: string; created_at: string; metadata?: Record<string, unknown> | null }
+type Row = {
+  id: string; content: string; created_at: string
+  summary?: string | null; tags?: string[] | null; category?: string | null
+  metadata?: Record<string, unknown> | null
+}
 
-function formatRow(t: Row, maxChars: number): string {
+function formatRow(t: Row, maxChars: number, similarity?: number): string {
   const when = new Date(t.created_at).toISOString().slice(0, 10)
   const body = t.content.length > maxChars
     ? t.content.slice(0, maxChars) + `\n…[trimmed — ${t.content.length.toLocaleString('en-US')} chars total; call get_thought for the full text]`
     : t.content
-  return `id: ${t.id}\nsaved: ${when}\n${body}`
+  const head = [`id: ${t.id}`, `saved: ${when}`]
+  if (similarity !== undefined) head.push(`match: ${Math.round(similarity * 100)}%`)
+  if (t.category) head.push(`category: ${t.category}`)
+  if (t.tags?.length) head.push(`tags: ${t.tags.join(', ')}`)
+  return head.join(' · ') + (t.summary ? `\nsummary: ${t.summary}` : '') + `\n${body}`
+}
+
+// ── Meaning search helpers ──────────────────────────────────────────────────
+const SEARCH_THRESHOLD = 0.3 // wider net than the graph's 0.5 — search should find more
+const MAX_RELATED = 3
+
+// Through the embedding gateway; null means "use keyword search instead"
+async function embedQuery(query: string): Promise<number[] | null> {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/generate-embedding`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SERVICE_ROLE_KEY}` },
+      body: JSON.stringify({ text: query, userId: OWNER_USER_ID, source: 'mcp-search' }),
+      signal: AbortSignal.timeout(20_000),
+    })
+    const d = await res.json().catch(() => ({}))
+    if (!Array.isArray(d.embedding)) console.error('[mcp] no embedding:', d.error ?? res.status)
+    return Array.isArray(d.embedding) ? d.embedding : null
+  } catch (err) {
+    console.error('[mcp] embedding call failed:', String(err))
+    return null
+  }
+}
+
+type Related = { id: string; similarity: number; label: string }
+
+// For each result, the thoughts it is linked to in the graph (either direction)
+// deno-lint-ignore no-explicit-any
+async function linkedNeighbours(db: any, ids: string[]): Promise<Map<string, Related[]>> {
+  const out = new Map<string, Related[]>()
+  try {
+    const list = ids.join(',')
+    const { data: links, error } = await db.from('thought_links')
+      .select('source_thought_id, target_thought_id, similarity_score')
+      .eq('user_id', OWNER_USER_ID)
+      .or(`source_thought_id.in.(${list}),target_thought_id.in.(${list})`)
+      .order('similarity_score', { ascending: false })
+      .limit(200)
+    if (error || !links?.length) return out
+    const pairs: { from: string; to: string; sim: number }[] = []
+    for (const l of links as { source_thought_id: string; target_thought_id: string; similarity_score: number }[]) {
+      if (ids.includes(l.source_thought_id)) pairs.push({ from: l.source_thought_id, to: l.target_thought_id, sim: l.similarity_score })
+      if (ids.includes(l.target_thought_id)) pairs.push({ from: l.target_thought_id, to: l.source_thought_id, sim: l.similarity_score })
+    }
+    const otherIds = [...new Set(pairs.map(p => p.to))]
+    const { data: others } = await db.from('thoughts')
+      .select('id, content, summary').eq('user_id', OWNER_USER_ID).in('id', otherIds)
+    const label = new Map<string, string>()
+    for (const o of (others ?? []) as { id: string; content: string; summary: string | null }[]) {
+      const first = (o.summary?.trim() || o.content.replace(/\s+/g, ' ').trim())
+      label.set(o.id, first.length > 140 ? first.slice(0, 140) + '…' : first)
+    }
+    for (const p of pairs) {
+      if (!label.has(p.to)) continue
+      const arr = out.get(p.from) ?? []
+      if (arr.length < MAX_RELATED && !arr.some(r => r.id === p.to)) arr.push({ id: p.to, similarity: p.sim, label: label.get(p.to)! })
+      out.set(p.from, arr)
+    }
+  } catch (err) {
+    console.error('[mcp] linked neighbours failed:', String(err))
+  }
+  return out
+}
+
+function formatRelated(list?: Related[]): string {
+  if (!list?.length) return ''
+  return '\nlinked thoughts:\n' + list.map(r => `  ↳ (${Math.round(r.similarity * 100)}%) id: ${r.id} — ${r.label}`).join('\n')
 }
 
 const text = (s: string, isError = false) => ({ content: [{ type: 'text', text: s }], ...(isError ? { isError: true } : {}) })
@@ -139,23 +216,45 @@ async function callTool(name: string, args: Record<string, unknown>) {
     const query = String(args.query ?? '').trim()
     if (!query) return text('Give me something to search for.', true)
     const limit = clampInt(args.limit, 1, 25, 10)
+
+    // 1. Meaning search: turn the query into an embedding (through the gateway),
+    //    then let the database find the closest thoughts — only this owner's.
+    const embedding = await embedQuery(query)
+    if (embedding) {
+      const { data, error } = await db.rpc('search_thoughts', {
+        query_embedding: JSON.stringify(embedding),
+        p_user_id: OWNER_USER_ID,
+        match_threshold: SEARCH_THRESHOLD,
+        match_count: limit,
+      })
+      if (error) console.error('[mcp] semantic search failed, using keywords:', error.message)
+      else if (data?.length) {
+        const rows = data as (Row & { similarity: number })[]
+        const related = await linkedNeighbours(db, rows.map(r => r.id))
+        return text(`${rows.length} thought(s) related to "${query}" (meaning search):\n\n` +
+          rows.map(t => formatRow(t, PREVIEW_CHARS, t.similarity) + formatRelated(related.get(t.id))).join('\n\n---\n\n'))
+      }
+    }
+
+    // 2. Fallback: keyword match (no embedding available, or nothing close enough)
     // % and _ are wildcards in ilike — escape them so they're matched literally
     const pattern = '%' + query.replace(/[\\%_]/g, m => '\\' + m) + '%'
     const { data, error } = await db.from('thoughts')
-      .select('id, content, created_at')
+      .select('id, content, summary, tags, category, created_at')
       .eq('user_id', OWNER_USER_ID)
       .ilike('content', pattern)
       .order('created_at', { ascending: false })
       .limit(limit)
     if (error) throw error
-    if (!data?.length) return text(`No thoughts contain "${query}". Try a shorter keyword or a synonym.`)
-    return text(`${data.length} thought(s) containing "${query}":\n\n` + data.map(t => formatRow(t, PREVIEW_CHARS)).join('\n\n---\n\n'))
+    const how = embedding ? 'nothing close in meaning; keyword match' : 'meaning search unavailable; keyword match'
+    if (!data?.length) return text(`Nothing in the brain matches "${query}" (${how}). Try describing it differently.`)
+    return text(`${data.length} thought(s) containing "${query}" (${how}):\n\n` + data.map(t => formatRow(t, PREVIEW_CHARS)).join('\n\n---\n\n'))
   }
 
   if (name === 'list_recent') {
     const limit = clampInt(args.limit, 1, 50, 10)
     const { data, error } = await db.from('thoughts')
-      .select('id, content, created_at')
+      .select('id, content, summary, tags, category, created_at')
       .eq('user_id', OWNER_USER_ID)
       .order('created_at', { ascending: false })
       .limit(limit)
@@ -168,7 +267,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
     const id = String(args.id ?? '').trim()
     if (!/^[0-9a-f-]{36}$/i.test(id)) return text('That is not a valid thought id.', true)
     const { data, error } = await db.from('thoughts')
-      .select('id, content, created_at, metadata')
+      .select('id, content, summary, tags, category, created_at, metadata')
       .eq('user_id', OWNER_USER_ID)
       .eq('id', id)
       .maybeSingle()
@@ -181,7 +280,10 @@ async function callTool(name: string, args: Record<string, unknown>) {
     const content = String(args.content ?? '').trim()
     if (!content) return text('Nothing to save.', true)
     const { data, error } = await db.from('thoughts')
-      .insert({ content: content.slice(0, 20_000), user_id: OWNER_USER_ID, metadata: { source: 'mcp' } })
+      // upsert: saving the exact same text twice updates the existing thought
+      // instead of creating a duplicate (the unique index from Level 6, Step 0)
+      .upsert({ content: content.slice(0, 20_000), user_id: OWNER_USER_ID, metadata: { source: 'mcp' } },
+        { onConflict: 'dedup_key,user_id', ignoreDuplicates: false })
       .select('id, created_at')
       .single()
     if (error) throw error
@@ -212,7 +314,8 @@ async function handleMessage(msg: any): Promise<unknown | null> {
         serverInfo: SERVER_INFO,
         instructions:
           "This server is the user's personal knowledge base. Search it whenever the user refers to something they saved, " +
-          'watched, read or noted, or asks what they know about a topic. Quote what you find and say when nothing matches.',
+          'watched, read or noted, or asks what they know about a topic. Search works by meaning, and each result lists ' +
+          'linked thoughts — mention those connections when useful. Quote what you find and say when nothing matches.',
       })
     }
     case 'ping':

@@ -159,11 +159,13 @@ Deno.serve(async (req: Request) => {
     }
 
     // ── Anything else: save it ─────────────────────────────────────────
-    const { error } = await db.from('thoughts').insert({
+    // upsert: if Telegram redelivers a message (or you send the same text
+    // twice), the existing thought is updated instead of duplicated
+    const { error } = await db.from('thoughts').upsert({
       content: text,
       user_id: OWNER_USER_ID,
       metadata: { source: 'telegram', telegram_message_id: message.message_id },
-    })
+    }, { onConflict: 'dedup_key,user_id', ignoreDuplicates: false }).select('id, created_at').single()
     if (error) throw error
     await reply(chatId, '✅ Saved to your brain')
     return ok()

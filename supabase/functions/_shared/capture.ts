@@ -60,11 +60,13 @@ export async function saveCapture(admin: SupabaseClient, opts: {
   const truncated = opts.sourceText.length > MAX_CHARS
   const sourceText = truncated ? opts.sourceText.slice(0, MAX_CHARS) : opts.sourceText
 
-  const { data: thought, error } = await admin.from('thoughts').insert({
+  // upsert: capturing the same page/video twice updates the existing thought
+  // instead of creating a duplicate (unique index from Level 6, Step 0)
+  const { data: thought, error } = await admin.from('thoughts').upsert({
     user_id: opts.userId,
     content: opts.content.slice(0, MAX_CHARS + 2000),
     metadata: opts.metadata,
-  }).select('id').single()
+  }, { onConflict: 'dedup_key,user_id', ignoreDuplicates: false }).select('id, created_at').single()
   if (error) throw new Error('Could not save the thought: ' + error.message)
 
   // Non-fatal: the thought is already saved either way (same rule as Level 2)

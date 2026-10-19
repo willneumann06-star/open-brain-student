@@ -443,7 +443,11 @@
   async function insertThought(content, metadata) {
     const row = { content, user_id: user.id }
     if (metadata) row.metadata = metadata
-    const { data, error } = await db.from('thoughts').insert(row).select('id').single()
+    // upsert: saving the exact same text twice updates the existing thought
+    // instead of creating a duplicate (unique index from Level 6, Step 0)
+    const { data, error } = await db.from('thoughts')
+      .upsert(row, { onConflict: 'dedup_key,user_id', ignoreDuplicates: false })
+      .select('id, created_at').single()
     if (error) throw error
     return data.id
   }
