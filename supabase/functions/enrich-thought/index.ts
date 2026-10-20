@@ -5,10 +5,12 @@
 // (a trigger on the thoughts table — see the Level 5 SQL). It works no matter
 // how the thought arrived: web app, Telegram, YouTube/URL capture, or Claude.
 //
-// For each thought it does three jobs, each only if not already done:
+// For each thought it does four jobs, each only if not already done:
 //   1. Enrichment (Level 5) — tags, category, one-line summary, via call-llm
 //   2. Embedding  (Level 6) — its "meaning coordinates", via generate-embedding
 //   3. Linking    (Level 6) — saves links to its 5 closest neighbours (>50%)
+//   4. Chunking   (Level 7) — long captures (>2,000 chars) cut into ~300-word
+//                             pieces, each with its own embedding
 // A failure in one job never stops the others, and never fails the save.
 //
 // DEPLOY WITH:  npx supabase functions deploy enrich-thought --no-verify-jwt
@@ -21,10 +23,13 @@
 //
 // BACKFILL: POST {"backfill": true} to process every thought that is missing
 // its enrichment OR its embedding (up to 50 per call). Run it again until it
-// says processed: 0. Safe to run any number of times.
+// says processed: 0. Safe to run any number of times. (Chunking old thoughts
+// has its own backfill: the backfill-chunks function.)
 // ============================================================================
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { saveThoughtChunksSafe } from '../_shared/thought-chunks.ts'
+import { shouldChunk } from '../_shared/chunking.ts'
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ?? ''
 const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
@@ -173,7 +178,8 @@ async function processOne(id: string, tally: Record<string, number>) {
   if (!data) return bump('not found')
   if (!data.user_id) return bump('no owner')
   const t: Thought = { ...data, has_embedding: data.has_embedding != null }
-  if ((t.enriched_at || t.category === 'digest') && t.has_embedding) return bump('already done')
+  const needsChunks = await missingChunks(t)
+  if ((t.enriched_at || t.category === 'digest') && t.has_embedding && !needsChunks) return bump('already done')
 
   // Each job on its own: one failing never stops the other
   try {
@@ -191,6 +197,21 @@ async function processOne(id: string, tally: Record<string, number>) {
     console.error(`[enrich] ${id}:`, String(err))
     bump('embed failed')
   }
+  // Job 4: chunk it, if it's long enough to be worth it. Never throws.
+  if (needsChunks) {
+    const n = await saveThoughtChunksSafe(db(), t.id, String(t.content ?? ''), 'enrich-thought', 'summary', t.user_id!)
+    if (n) bump('chunks', n)
+  }
+}
+
+// Long enough to chunk, and not chunked yet? (Digests are summaries — no need.)
+async function missingChunks(t: Thought): Promise<boolean> {
+  if (t.category === 'digest' || !shouldChunk(t.content)) return false
+  const { count, error } = await db().from('thought_chunks')
+    .select('id', { count: 'exact', head: true })
+    .eq('thought_id', t.id).eq('origin', 'summary')
+  if (error) { console.error(`[enrich] ${t.id} chunk check failed:`, error.message); return false }
+  return (count ?? 0) === 0
 }
 
 Deno.serve(async (req) => {

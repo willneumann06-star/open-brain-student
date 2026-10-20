@@ -34,7 +34,7 @@ const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
 const MCP_ACCESS_KEY = Deno.env.get('MCP_ACCESS_KEY') ?? ''
 const OWNER_USER_ID = Deno.env.get('OWNER_USER_ID') ?? ''
 
-const SERVER_INFO = { name: 'open-brain', version: '1.1.0' }
+const SERVER_INFO = { name: 'open-brain', version: '1.2.0' }
 const SUPPORTED_PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05']
 
 const corsHeaders = {
@@ -69,16 +69,16 @@ const TOOLS = [
   {
     name: 'search_thoughts',
     description:
-      "Search the user's personal knowledge base (their 'Open Brain') by meaning. " +
+      "Search the user's personal knowledge base (their 'Open Brain'). " +
       'Captures include typed notes, voice notes, Telegram messages, YouTube transcripts, PDFs and web articles. ' +
-      'This is semantic search: describe the idea in natural words — it finds related thoughts even when they use ' +
-      'different words. Each result shows a similarity score and the thoughts it is linked to in the user\'s thought graph. ' +
-      'If meaning search is unavailable it falls back to keyword matching. ' +
+      'Hybrid search: matches by meaning (paraphrases work) AND by exact words (names, numbers, codes), and looks inside ' +
+      'long captures to find the specific passage that answers the query. Each result shows a match score, the passage ' +
+      'that matched when it came from inside a long capture, and the thoughts it is linked to in the user\'s thought graph. ' +
       'Long results are trimmed — use get_thought with the id to read one in full.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'What to look for, in natural words, e.g. "how startups get valued"' },
+        query: { type: 'string', description: 'What to look for — natural words, or an exact name/term, e.g. "how startups get valued" or "Berkus"' },
         limit: { type: 'number', description: 'Max results, 1-25 (default 10)' },
       },
       required: ['query'],
@@ -201,6 +201,18 @@ async function linkedNeighbours(db: any, ids: string[]): Promise<Map<string, Rel
   return out
 }
 
+type HybridRow = Row & { similarity: number; matched_chunk: string | null; match_source: string }
+
+// When the match came from inside a long capture, show THAT passage — not the
+// opening of the document, which may have nothing to do with the question.
+function formatHybrid(t: HybridRow): string {
+  const sim = t.similarity > 0 ? t.similarity : undefined // 0 = found by exact words only
+  if (!t.matched_chunk) return formatRow(t, PREVIEW_CHARS, sim)
+  const title = t.content.split('\n')[0].slice(0, 200)
+  const header = formatRow({ ...t, content: title }, PREVIEW_CHARS, sim)
+  return `${header}\n…(from partway through a longer capture — ${t.content.length.toLocaleString('en-US')} chars total; call get_thought for all of it):\n${t.matched_chunk}`
+}
+
 function formatRelated(list?: Related[]): string {
   if (!list?.length) return ''
   return '\nlinked thoughts:\n' + list.map(r => `  ↳ (${Math.round(r.similarity * 100)}%) id: ${r.id} — ${r.label}`).join('\n')
@@ -217,38 +229,41 @@ async function callTool(name: string, args: Record<string, unknown>) {
     if (!query) return text('Give me something to search for.', true)
     const limit = clampInt(args.limit, 1, 25, 10)
 
-    // 1. Meaning search: turn the query into an embedding (through the gateway),
-    //    then let the database find the closest thoughts — only this owner's.
-    const embedding = await embedQuery(query)
-    if (embedding) {
-      const { data, error } = await db.rpc('search_thoughts', {
-        query_embedding: JSON.stringify(embedding),
-        p_user_id: OWNER_USER_ID,
-        match_threshold: SEARCH_THRESHOLD,
-        match_count: limit,
-      })
-      if (error) console.error('[mcp] semantic search failed, using keywords:', error.message)
-      else if (data?.length) {
-        const rows = data as (Row & { similarity: number })[]
-        const related = await linkedNeighbours(db, rows.map(r => r.id))
-        return text(`${rows.length} thought(s) related to "${query}" (meaning search):\n\n` +
-          rows.map(t => formatRow(t, PREVIEW_CHARS, t.similarity) + formatRelated(related.get(t.id))).join('\n\n---\n\n'))
-      }
+    // Hybrid search (Level 7): meaning AND exact words, fused into one ranking,
+    // checking each long capture's chunks as well as the whole thing.
+    // p_user_id is required: this function uses the service role key, which
+    // skips row-level security, so the query itself must say whose brain it is.
+    const embedding = await embedQuery(query) // null → the database does keyword-only
+    const { data, error } = await db.rpc('search_thoughts', {
+      query_text: query,
+      p_user_id: OWNER_USER_ID,
+      query_embedding: embedding ? JSON.stringify(embedding) : null,
+      match_threshold: SEARCH_THRESHOLD,
+      match_count: limit,
+      max_per_document: 2,
+    })
+    if (!error && data?.length) {
+      const rows = data as HybridRow[]
+      const related = await linkedNeighbours(db, rows.map(r => r.id))
+      const how = embedding ? 'meaning + exact words' : 'exact words only — meaning search unavailable'
+      return text(`${rows.length} thought(s) for "${query}" (${how}):\n\n` +
+        rows.map(t => formatHybrid(t) + formatRelated(related.get(t.id))).join('\n\n---\n\n'))
     }
+    if (error) console.error('[mcp] hybrid search failed, using plain keyword match:', error.message)
+    else return text(`Nothing in the brain matches "${query}", by meaning or by exact words. Try describing it differently.`)
 
-    // 2. Fallback: keyword match (no embedding available, or nothing close enough)
+    // Last resort (only if the search function itself errored): plain keyword match
     // % and _ are wildcards in ilike — escape them so they're matched literally
     const pattern = '%' + query.replace(/[\\%_]/g, m => '\\' + m) + '%'
-    const { data, error } = await db.from('thoughts')
+    const { data: kw, error: kwErr } = await db.from('thoughts')
       .select('id, content, summary, tags, category, created_at')
       .eq('user_id', OWNER_USER_ID)
       .ilike('content', pattern)
       .order('created_at', { ascending: false })
       .limit(limit)
-    if (error) throw error
-    const how = embedding ? 'nothing close in meaning; keyword match' : 'meaning search unavailable; keyword match'
-    if (!data?.length) return text(`Nothing in the brain matches "${query}" (${how}). Try describing it differently.`)
-    return text(`${data.length} thought(s) containing "${query}" (${how}):\n\n` + data.map(t => formatRow(t, PREVIEW_CHARS)).join('\n\n---\n\n'))
+    if (kwErr) throw kwErr
+    if (!kw?.length) return text(`Nothing in the brain matches "${query}".`)
+    return text(`${kw.length} thought(s) containing "${query}" (plain keyword match):\n\n` + kw.map(t => formatRow(t, PREVIEW_CHARS)).join('\n\n---\n\n'))
   }
 
   if (name === 'list_recent') {

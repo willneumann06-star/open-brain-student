@@ -136,6 +136,8 @@
     .more { background: none; color: #818cf8; padding: 4px 0 0; font-size: 0.75rem; }
     .more:hover:not(:disabled) { background: none; color: #a5b4fc; }
     .thought-time { font-size: 0.72rem; color: #444; margin-top: 8px; }
+    .chunk-note { font-size: 0.72rem; color: #666; margin: 8px 0 4px; font-style: italic; }
+    .chunk-text { font-size: 0.875rem; color: #bbb; line-height: 1.55; white-space: pre-wrap; border-left: 2px solid #333; padding-left: 10px; }
     .empty { color: #333; font-size: 0.875rem; text-align: center; padding: 40px 0; }
     details.manual { margin-top: 14px; border-top: 1px solid #1e1e1e; padding-top: 12px; }
     details.manual summary { cursor: pointer; font-size: 0.8rem; color: #777; list-style: none; }
@@ -723,18 +725,30 @@
     $('searchLabel').textContent = 'Searching...'
     out.innerHTML = ''
     try {
-      // % and _ are wildcards in ilike — escape them so they're searched literally
-      const pattern = '%' + q.replace(/[\\%_]/g, m => '\\' + m) + '%'
-      const { data, error } = await db.from('thoughts').select('*')
-        .ilike('content', pattern).order('created_at', { ascending: false }).limit(50)
-      if (error) throw error
-      $('searchLabel').textContent = data.length ? `${data.length}${data.length === 50 ? '+' : ''} result${data.length === 1 ? '' : 's'} for "${q}"` : ''
-      out.innerHTML = data.length ? data.map(t => card(t, q)).join('') : `<div class="empty">Nothing matches "${esc(q)}".</div>`
+      // Hybrid search (Level 7) runs on your server: it needs your OpenRouter
+      // key to understand meaning, and that key must never be in a web page.
+      const r = await callFunction('search-brain', { query: q, limit: 20 })
+      const data = r.results || []
+      const how = r.mode === 'hybrid' ? 'by meaning + exact words' : 'by exact words only'
+      $('searchLabel').textContent = data.length ? `${data.length} result${data.length === 1 ? '' : 's'} for "${q}" — ${how}` : ''
+      out.innerHTML = data.length ? data.map(t => searchCard(t, q)).join('') : `<div class="empty">Nothing matches "${esc(q)}".</div>`
     } catch (err) {
       $('searchLabel').textContent = ''
       out.innerHTML = '<div class="empty" style="color:#ef4444">Search failed: ' + esc(err.message) + '</div>'
     }
   })
+  // A search result. When the match came from inside a long capture, show that
+  // passage — the part that actually answered your search — under the title.
+  function searchCard(t, q) {
+    if (!t.matched_chunk) return card(t, q)
+    const title = t.content.split('\n')[0]
+    return `<div class="thought">
+      <div class="thought-text">${highlight(title, q)}</div>
+      <div class="chunk-note">from partway through a longer capture</div>
+      <div class="chunk-text">${highlight(t.matched_chunk, q)}</div>
+      <div class="thought-time">${fmt(t.created_at)}</div>
+    </div>`
+  }
   function clearSearch() { $('searchInput').value = ''; $('searchResults').innerHTML = ''; $('searchLabel').textContent = ''; $('searchInput').focus() }
 
   // ─── lists ────────────────────────────────────────────────
