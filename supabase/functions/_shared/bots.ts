@@ -115,3 +115,12 @@ export async function sendTelegram(text: string): Promise<boolean> {
 export function azDate(d: Date, opts: Intl.DateTimeFormatOptions = { weekday: 'short', day: 'numeric', month: 'short' }): string {
   return d.toLocaleDateString('en-AU', { timeZone: 'America/Phoenix', ...opts })
 }
+
+// "week:" at the very start of a note — or in the title of a PDF/link/YouTube
+// capture (their first line starts with 📄 / 🔗 / 📹). A journal entry that
+// merely says "This week: ..." is NOT picked up.
+export function isWeekItem(content: string): boolean {
+  if (/^\s*week\s*:/i.test(content)) return true
+  const firstLine = content.split('\n')[0].slice(0, 300)
+  return /^\s*(📄|🔗|📹)/u.test(firstLine) && /\bweek\s*:/i.test(firstLine)
+}
