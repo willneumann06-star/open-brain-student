@@ -136,6 +136,8 @@
     .more { background: none; color: #818cf8; padding: 4px 0 0; font-size: 0.75rem; }
     .more:hover:not(:disabled) { background: none; color: #a5b4fc; }
     .thought-time { font-size: 0.72rem; color: #444; margin-top: 8px; }
+    .bot-badge { display: inline-block; font-size: 0.68rem; color: #a5a3ff; background: #1d1b3a; border-radius: 6px; padding: 1px 6px; margin-left: 6px; }
+    .bot-toggle { font-weight: 400; text-transform: none; letter-spacing: 0; color: #666; font-size: 0.75rem; cursor: pointer; }
     .chunk-note { font-size: 0.72rem; color: #666; margin: 8px 0 4px; font-style: italic; }
     .chunk-text { font-size: 0.875rem; color: #bbb; line-height: 1.55; white-space: pre-wrap; border-left: 2px solid #333; padding-left: 10px; }
     .empty { color: #333; font-size: 0.875rem; text-align: center; padding: 40px 0; }
@@ -313,7 +315,10 @@
 
     <!-- RECENT (always shown under capture tabs; own tab for focus) -->
     <div id="recentBlock">
-      <div class="section-label">Recent Thoughts</div>
+      <div class="section-label" style="display:flex;justify-content:space-between;align-items:center">
+        <span>Recent Thoughts</span>
+        <label class="bot-toggle"><input type="checkbox" id="hideBots" onchange="saveHideBots(); loadRecent()"> Hide 🤖 bot notes</label>
+      </div>
       <div id="list"><div class="empty">Loading...</div></div>
     </div>
   </div>
@@ -772,9 +777,19 @@
     return `<div class="thought">
       <div class="thought-text${long ? ' clamped' : ''}">${highlight(shown, q)}</div>
       ${long ? '<button class="more" onclick="expand(this)">Show more</button>' : ''}
-      <div class="thought-time">${fmt(t.created_at)}</div>
+      <div class="thought-time">${fmt(t.created_at)}${botBadge(t)}</div>
     </div>`
   }
+  // Notes written by your bots (news watcher, week planner) are labelled so
+  // they're never mistaken for your own thinking
+  function botBadge(t) {
+    const m = t.metadata
+    if (!m || !m.bot) return ''
+    const name = m.source === 'week-planner' ? 'week planner' : m.source === 'news-watcher' ? 'news watcher' : 'bot'
+    return '<span class="bot-badge">🤖 ' + esc(name) + '</span>'
+  }
+  function saveHideBots() { try { localStorage.setItem('hideBots', $('hideBots').checked ? '1' : '') } catch {} }
+  try { if (localStorage.getItem('hideBots')) $('hideBots').checked = true } catch {}
   function expand(btn) {
     const el = btn.previousElementSibling
     const clamped = el.classList.toggle('clamped')
@@ -784,9 +799,11 @@
   async function loadRecent() {
     const list = $('list')
     try {
-      const { data, error } = await db.from('thoughts').select('*')
-        .order('created_at', { ascending: false }).limit(20)
+      const hide = $('hideBots').checked
+      const { data: raw, error } = await db.from('thoughts').select('*')
+        .order('created_at', { ascending: false }).limit(hide ? 60 : 20)
       if (error) throw error
+      const data = hide ? (raw || []).filter(t => !(t.metadata && t.metadata.bot)).slice(0, 20) : raw
       list.innerHTML = data && data.length ? data.map(t => card(t)).join('')
         : '<div class="empty">No thoughts yet. Capture something above.</div>'
     } catch (e) {

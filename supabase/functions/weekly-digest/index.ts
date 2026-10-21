@@ -54,16 +54,16 @@ Deno.serve(async () => {
       return json({ ok: true, skipped: 'already written this week' })
     }
 
-    // 2. This week's captures (not old digests)
+    // 2. This week's captures (not old digests, not bot notes — the digest is about YOUR thinking)
     const { data, error } = await db.from('thoughts')
-      .select('content, category, summary, tags, created_at')
+      .select('content, category, summary, tags, created_at, metadata')
       .eq('user_id', OWNER_USER_ID)
       .gte('created_at', weekAgo.toISOString())
       .or('category.is.null,category.neq.digest')
       .order('created_at', { ascending: true })
       .limit(300)
     if (error) throw error
-    const rows = (data ?? []) as Row[]
+    const rows = ((data ?? []) as (Row & { metadata: Record<string, unknown> | null })[]).filter(r => !r.metadata?.bot)
     if (rows.length < MIN_THOUGHTS) {
       console.log(`[digest] only ${rows.length} thoughts this week — not enough for a digest`)
       return json({ ok: true, skipped: `only ${rows.length} thoughts this week (need ${MIN_THOUGHTS})` })

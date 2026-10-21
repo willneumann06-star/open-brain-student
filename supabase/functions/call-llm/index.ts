@@ -11,6 +11,11 @@
 //                                service: Groq, Together, a local model…)
 //   LLM_MODEL    = the model name for that provider
 //
+// BOTS: a caller may also ask for {"provider": "xai", "search": true} — Grok
+// with live web + X search, for the news watcher. Uses XAI_API_KEY (and
+// optional XAI_MODEL, default grok-4.7). Only public topics should ever be
+// sent this way; anything personal stays on LLM_PROVIDER.
+//
 // Every agent (enrich-thought, weekly-digest, anything you build later) calls
 // THIS function instead of calling an AI directly. Nothing else in your
 // project knows which AI you use, or holds its key.
@@ -37,7 +42,11 @@ const DEFAULT_MODEL = (Deno.env.get('LLM_MODEL') ?? '').trim()
 // A model not listed here is logged with cost 0 (tokens are still recorded).
 const PRICES: Array<[prefix: string, input: number, output: number]> = [
   ['claude-haiku-4-5', 1, 5],
+  ['grok-4', 2, 6],
 ]
+// Grok's search tools are billed on top of tokens (US$, per item)
+const XAI_WEB_SEARCH_PER_CALL = 0.005
+const XAI_X_POST_PER_POST = 0.005
 
 function estimateCost(model: string, inTok: number, outTok: number): number {
   const p = PRICES.find(([prefix]) => model.startsWith(prefix))
@@ -60,8 +69,8 @@ function sameSecret(a: string, b: string): boolean {
   return diff === 0
 }
 
-type Req = { prompt: string; systemPrompt?: string; model: string; maxTokens: number }
-type Res = { text: string; inTok: number; outTok: number }
+type Req = { prompt: string; systemPrompt?: string; model: string; maxTokens: number; search?: boolean; searchDays?: number }
+type Res = { text: string; inTok: number; outTok: number; toolCost?: number; sources?: string[] }
 
 // ── Providers ───────────────────────────────────────────────────────────────
 async function callAnthropic(r: Req): Promise<Res> {
@@ -113,9 +122,50 @@ async function callOpenAICompatible(r: Req): Promise<Res> {
   return { text: d.choices?.[0]?.message?.content ?? '', inTok: d.usage?.prompt_tokens ?? 0, outTok: d.usage?.completion_tokens ?? 0 }
 }
 
+// Grok via xAI's Responses API. With search on, Grok can run live web and X
+// searches itself (server-side) before answering.
+async function callXai(r: Req): Promise<Res> {
+  const key = (Deno.env.get('XAI_API_KEY') ?? '').trim()
+  if (!key) throw new Error('XAI_API_KEY secret is missing')
+  const days = Math.min(Math.max(Math.floor(r.searchDays ?? 7), 1), 30)
+  const fromDate = new Date(Date.now() - days * 864e5).toISOString().slice(0, 10)
+  const res = await fetch('https://api.x.ai/v1/responses', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: r.model,
+      input: [
+        ...(r.systemPrompt ? [{ role: 'system', content: r.systemPrompt }] : []),
+        { role: 'user', content: r.prompt },
+      ],
+      max_output_tokens: r.maxTokens,
+      ...(r.search ? { tools: [{ type: 'web_search' }, { type: 'x_search', from_date: fromDate }], max_turns: 6 } : {}),
+    }),
+    signal: AbortSignal.timeout(140_000),
+  })
+  if (!res.ok) throw new Error(`xAI HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
+  const d = await res.json()
+  // The answer is the output_text block(s) inside the 'message' item of output[]
+  const text = (d.output ?? [])
+    .filter((o: { type: string }) => o.type === 'message')
+    .flatMap((o: { content?: { type: string; text?: string }[] }) => o.content ?? [])
+    .filter((c: { type: string }) => c.type === 'output_text')
+    .map((c: { text?: string }) => c.text ?? '').join('')
+  const tools = d.usage?.server_side_tool_usage_details ?? {}
+  const toolCost = Number(tools.web_search_calls ?? 0) * XAI_WEB_SEARCH_PER_CALL + Number(tools.x_posts_fetched ?? 0) * XAI_X_POST_PER_POST
+  return {
+    text,
+    inTok: d.usage?.input_tokens ?? 0,
+    outTok: d.usage?.output_tokens ?? 0,
+    toolCost,
+    sources: Array.isArray(d.citations) ? d.citations.filter((u: unknown) => typeof u === 'string') : [],
+  }
+}
+
 const PROVIDERS: Record<string, (r: Req) => Promise<Res>> = {
   anthropic: callAnthropic,
   openai: callOpenAICompatible,
+  xai: callXai,
 }
 
 // ── Receipt (never allowed to fail the call) ────────────────────────────────
@@ -144,16 +194,19 @@ Deno.serve(async (req) => {
   const prompt = typeof body?.prompt === 'string' ? body.prompt : ''
   if (!prompt.trim()) return json({ error: 'prompt is required' }, 400)
 
-  const model = String(body?.model || DEFAULT_MODEL).trim()
+  // A caller may pick a provider for one call (the news bot asks for xai);
+  // otherwise the project-wide LLM_PROVIDER is used
+  const provider = typeof body?.provider === 'string' && body.provider ? body.provider.trim().toLowerCase() : PROVIDER
+  const model = String(body?.model || (provider === PROVIDER ? DEFAULT_MODEL : provider === 'xai' ? (Deno.env.get('XAI_MODEL') ?? 'grok-4.7').trim() : '')).trim()
   if (!model) return json({ error: 'No model set — add LLM_MODEL to your Supabase secrets' }, 500)
 
-  const call = PROVIDERS[PROVIDER]
-  if (!call) return json({ error: `Unknown LLM_PROVIDER "${PROVIDER}". Use one of: ${Object.keys(PROVIDERS).join(', ')}` }, 500)
+  const call = PROVIDERS[provider]
+  if (!call) return json({ error: `Unknown provider "${provider}". Use one of: ${Object.keys(PROVIDERS).join(', ')}` }, 500)
 
   const maxTokens = Math.min(Math.max(Math.floor(Number(body?.maxTokens) || 1024), 1), 8192)
 
   try {
-    const r = await call({ prompt, systemPrompt: body?.systemPrompt, model, maxTokens })
+    const r = await call({ prompt, systemPrompt: body?.systemPrompt, model, maxTokens, search: body?.search === true, searchDays: Number(body?.searchDays) || undefined })
     if (typeof body?.userId === 'string' && body.userId) {
       logUsage({
         user_id: body.userId,
@@ -162,10 +215,10 @@ Deno.serve(async (req) => {
         source: typeof body?.source === 'string' ? body.source : null,
         prompt_tokens: r.inTok,
         completion_tokens: r.outTok,
-        cost_usd: estimateCost(model, r.inTok, r.outTok),
+        cost_usd: estimateCost(model, r.inTok, r.outTok) + (r.toolCost ?? 0),
       })
     }
-    return json({ text: r.text, model, usage: { input_tokens: r.inTok, output_tokens: r.outTok } })
+    return json({ text: r.text, model, sources: r.sources ?? [], usage: { input_tokens: r.inTok, output_tokens: r.outTok } })
   } catch (err) {
     console.error('[call-llm] failed:', String(err))
     return json({ error: String(err instanceof Error ? err.message : err) }, 502)
