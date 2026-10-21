@@ -6,8 +6,9 @@
 //   2. Whatever a bot writes is LABELLED: metadata.bot = true, plus which bot.
 //      Your weekly digest skips bot notes, and the app marks them with 🤖, so
 //      bot writing never gets mistaken for your own thinking.
-//   3. At most one run per bot every 5 days, so its open address can't be
-//      used to run up your AI bill.
+//   3. At most one run per bot per week (Monday–Sunday, Arizona time), so its
+//      open address can't be used to run up your AI bill — and a test run
+//      mid-week never blocks the next Monday's real run.
 // ============================================================================
 
 import { createClient, SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2'
@@ -16,7 +17,20 @@ const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ?? ''
 const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
 
 export const OWNER_USER_ID = Deno.env.get('OWNER_USER_ID') ?? ''
-export const MIN_DAYS_BETWEEN_RUNS = 5
+
+/** Monday 00:00 of the current week, Arizona time (UTC−7, no daylight saving). */
+export function startOfAzWeek(now = new Date()): Date {
+  const AZ = 7 * 3600e3
+  const az = new Date(now.getTime() - AZ)                 // Arizona wall-clock, read via getUTC*
+  const daysSinceMonday = (az.getUTCDay() + 6) % 7
+  const mondayAz = Date.UTC(az.getUTCFullYear(), az.getUTCMonth(), az.getUTCDate() - daysSinceMonday)
+  return new Date(mondayAz + AZ)
+}
+
+/** Has this bot already written a note this week? */
+export function ranThisWeek(last: Date | null, now = new Date()): boolean {
+  return !!last && last.getTime() >= startOfAzWeek(now).getTime()
+}
 
 export const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })

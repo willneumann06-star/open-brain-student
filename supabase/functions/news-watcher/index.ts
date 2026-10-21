@@ -9,12 +9,12 @@
 //
 // Privacy: Grok only ever sees the TOPICS below — nothing from your brain.
 // Cost: about $0.15–0.60 per brief (tokens + searches), receipts in llm_usage.
-// Safe to leave open: it runs at most once every 5 days.
+// Safe to leave open: it runs at most once a week (Mon–Sun, Arizona time).
 //
 // To change what it watches, edit TOPICS and redeploy.
 // ============================================================================
 
-import { askGateway, azDate, db, json, lastRun, MIN_DAYS_BETWEEN_RUNS, OWNER_USER_ID, saveBotNote, sendTelegram } from '../_shared/bots.ts'
+import { askGateway, azDate, db, json, lastRun, ranThisWeek, OWNER_USER_ID, saveBotNote, sendTelegram } from '../_shared/bots.ts'
 
 const BOT = 'news-watcher'
 
@@ -46,7 +46,7 @@ Deno.serve(async () => {
     const supa = db()
 
     const last = await lastRun(supa, BOT)
-    if (last && Date.now() - last.getTime() < MIN_DAYS_BETWEEN_RUNS * 864e5) {
+    if (ranThisWeek(last)) {
       console.log(`[${BOT}] already ran ${last.toISOString()} — skipping`)
       return json({ ok: true, skipped: 'already ran this week' })
     }

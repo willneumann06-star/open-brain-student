@@ -16,10 +16,10 @@
 //
 // Privacy: your week items are personal, so this uses your normal provider
 // (Claude Haiku via LLM_PROVIDER) — never Grok.
-// Safe to leave open: it plans at most once every 5 days.
+// Safe to leave open: it plans at most once a week (Mon–Sun, Arizona time).
 // ============================================================================
 
-import { askGateway, azDate, db, json, lastRun, MIN_DAYS_BETWEEN_RUNS, OWNER_USER_ID, saveBotNote, sendTelegram } from '../_shared/bots.ts'
+import { askGateway, azDate, db, json, lastRun, ranThisWeek, OWNER_USER_ID, saveBotNote, sendTelegram } from '../_shared/bots.ts'
 
 const BOT = 'week-planner'
 const MAX_ITEM_CHARS = 1500
@@ -58,13 +58,14 @@ Deno.serve(async () => {
     const supa = db()
 
     const last = await lastRun(supa, BOT)
-    if (last && Date.now() - last.getTime() < MIN_DAYS_BETWEEN_RUNS * 864e5) {
+    if (ranThisWeek(last)) {
       console.log(`[${BOT}] already planned ${last.toISOString()} — skipping`)
       return json({ ok: true, skipped: 'already planned this week' })
     }
 
-    // Everything since the last plan (or the last 8 days if this is the first one)
-    const since = last ?? new Date(Date.now() - 8 * 864e5)
+    // Every week: item from the last 8 days (on Monday 7am: everything since the
+    // Sunday before last). A mid-week test plan never "uses up" items.
+    const since = new Date(Date.now() - 8 * 864e5)
     const { data, error } = await supa.from('thoughts')
       .select('content, created_at, metadata')
       .eq('user_id', OWNER_USER_ID)
