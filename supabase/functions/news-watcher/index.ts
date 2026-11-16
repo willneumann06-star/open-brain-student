@@ -71,6 +71,8 @@ Deno.serve(async () => {
     return json({ ok: true, id, telegram: sent, chars: content.length })
   } catch (err) {
     console.error(`[${BOT}] failed:`, String(err))
+    // Failure alert (Nov 2026): tell William straight away instead of failing silently
+    await sendTelegram(`⚠️ Monday news brief failed: ${String(err).slice(0, 300)}`)
     return json({ ok: false, error: String(err) }, 500)
   }
 })

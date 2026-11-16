@@ -19,7 +19,7 @@
 // Safe to leave open: it plans at most once a week (Mon–Sun, Arizona time).
 // ============================================================================
 
-import { askGateway, azDate, db, isWeekItem, json, lastRun, ranThisWeek, OWNER_USER_ID, saveBotNote, sendTelegram } from '../_shared/bots.ts'
+import { askGateway, azDate, db, isWeekItem, json, lastRun, ranThisWeek, startOfAzWeek, OWNER_USER_ID, saveBotNote, sendTelegram } from '../_shared/bots.ts'
 
 const BOT = 'week-planner'
 const MAX_ITEM_CHARS = 1500
@@ -48,6 +48,19 @@ Deno.serve(async () => {
   try {
     if (!OWNER_USER_ID) return json({ ok: false, error: 'OWNER_USER_ID secret is missing' })
     const supa = db()
+
+    // Failure alert (Nov 2026): the news brief runs at 6:30am Monday. If nothing
+    // was saved this week by the time the planner runs (7am), tell William once.
+    if (Date.now() >= startOfAzWeek().getTime() + 7 * 3600e3) {
+      const lastNews = await lastRun(supa, 'news-watcher')
+      if (!ranThisWeek(lastNews)) {
+        const { data: alerted } = await supa.from('bot_runs').select('last_run').eq('bot', 'news-missing-alert').maybeSingle()
+        if (!alerted || !ranThisWeek(new Date(alerted.last_run))) {
+          await supa.from('bot_runs').upsert({ bot: 'news-missing-alert', last_run: new Date().toISOString() }, { onConflict: 'bot' })
+          await sendTelegram("⚠️ No news brief this week: news-watcher hadn't saved one by 7am. Check Supabase → Edge Functions → news-watcher → Logs today, before the logs expire.")
+        }
+      }
+    }
 
     const last = await lastRun(supa, BOT)
     if (ranThisWeek(last)) {
@@ -112,6 +125,8 @@ Deno.serve(async () => {
     return json({ ok: true, id, items: rows.length, telegram: sent })
   } catch (err) {
     console.error(`[${BOT}] failed:`, String(err))
+    // Failure alert (Nov 2026)
+    await sendTelegram(`⚠️ Week planner failed: ${String(err).slice(0, 300)}`)
     return json({ ok: false, error: String(err) }, 500)
   }
 })
