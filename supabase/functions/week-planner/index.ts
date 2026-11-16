@@ -74,6 +74,15 @@ Deno.serve(async () => {
     const title = `🗓️ Week plan — ${days[0]} to ${days[6]}`
 
     if (!rows.length) {
+      // Guard (security fix, Nov 2026): this path saves no plan, so the weekly
+      // guard above never trips. Without this, anyone who knows the URL could
+      // make the bot send you "nothing to plan" over and over. Tell you once a week max.
+      const EMPTY_KEY = `${BOT}-empty`
+      const { data: emptyRun } = await supa.from('bot_runs').select('last_run').eq('bot', EMPTY_KEY).maybeSingle()
+      if (emptyRun && ranThisWeek(new Date(emptyRun.last_run))) {
+        return json({ ok: true, skipped: 'already told you there was nothing to plan this week' })
+      }
+      await supa.from('bot_runs').upsert({ bot: EMPTY_KEY, last_run: new Date().toISOString() }, { onConflict: 'bot' })
       const msg = `${title}\n\nNothing saved with "week:" since the last plan, so there's nothing to plan.\n` +
         'Next time, save items like:\nweek: FIN 450 exam Thursday 10am'
       await sendTelegram(msg)

@@ -28,6 +28,10 @@ const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
 const BOT_TOKEN = Deno.env.get('TELEGRAM_BOT_TOKEN') ?? ''
 const OWNER_USER_ID = Deno.env.get('OWNER_USER_ID') ?? ''
 const ALLOWED_CHAT_ID = Deno.env.get('TELEGRAM_CHAT_ID') ?? ''
+// Security fix (Nov 2026): Telegram sends this header on every webhook call once
+// setWebhook is given a secret_token. If the secret is set, anything without it
+// is ignored, so a stranger can't post fake messages into your brain.
+const WEBHOOK_SECRET = Deno.env.get('TELEGRAM_WEBHOOK_SECRET') ?? ''
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -76,6 +80,7 @@ const HELP = [
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
   if (req.method !== 'POST') return ok()
+  if (WEBHOOK_SECRET && req.headers.get('x-telegram-bot-api-secret-token') !== WEBHOOK_SECRET) return ok()
 
   let chatId: number | string | undefined
   try {
